@@ -5,63 +5,63 @@
 
 using namespace std;
 
-cudaError_t maxWithCuda(int* columns_mins, int* matr, unsigned int size);
+cudaError_t maxWithCuda(int* max_of_mins, int* matr, unsigned int size);
 
 
-__global__ void minsRows(int * rows_mins, const int *matrix)
+__global__ void minsRows(int* max_of_mins, const int *matrix, unsigned int matrix_size)
 {
+    //printf("%i %i\n", blockIdx.x, blockDim.x);
     int thread_number = threadIdx.x;
-    int matrix_size = blockDim.x;
+    int block_number = blockIdx.x;
+    int block_size = blockDim.x;
 
-    int min_in_column = matrix[thread_number * matrix_size];
-    for (int i = 1; i < matrix_size; i++)
-        if (matrix[thread_number * matrix_size + i] < min_in_column)
-            min_in_column = matrix[thread_number * matrix_size + i];
-   
-    rows_mins[thread_number] = min_in_column;
+    int raw_number = (block_number * block_size + thread_number);
+    int min_in_column = matrix[raw_number * matrix_size];
+    for (int i = 1; i < matrix_size; i++) 
+        if (matrix[raw_number * matrix_size + i] < min_in_column)
+            min_in_column = matrix[raw_number * matrix_size + i];
+    
+    if (block_number == 0 && thread_number == 0)
+        *max_of_mins = min_in_column;
+    else
+        if (*max_of_mins < min_in_column)
+            *max_of_mins = min_in_column;
 }
 
 int main()
 {
-    const int matrSize = 10;
+    // Размер матрицы кратный 1024
+    const int matrSize = 20480, outputSize = 10;
+
+    printf("Matrix size %d\n", matrSize);
 
     int *matrix = new int[matrSize * matrSize];
     int *rows_mins = new int[matrSize];
+    int max_of_mins = 0;
     for (int i = 0; i < matrSize; i++) 
     {
         rows_mins[i] = 0;
         for (int j = 0; j < matrSize; j++) 
         {
             matrix[i * matrSize + j] = i + j;
-            printf("%i ", matrix[i * matrSize + j]);
+            if (i < outputSize && j < outputSize)
+                printf("%i ", matrix[i * matrSize + j]);
         }
-        printf("\n");
+        if (i < outputSize)
+            printf("\n");
     }
     printf("\n");
+    
 
 
-
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = maxWithCuda(rows_mins, matrix, matrSize);
+    // Add in parallel.
+    cudaError_t cudaStatus = maxWithCuda(&max_of_mins, matrix, matrSize);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "addWithCuda failed!");
         return 1;
     }
 
-    //Print output
-    printf("Mins of rows: ");
-    int max_matrix = rows_mins[0];
-    for (int i = 1; i < matrSize; i++) 
-    {
-        printf("%i ", rows_mins[i]);
-        if (rows_mins[i] > max_matrix)
-            max_matrix = rows_mins[i];
-    }
-    printf("\n");
-
-    printf("Max of mins %i\n", max_matrix);
-
-
+    printf("Max of mins %i\n", max_of_mins);
 
 
     // cudaDeviceReset must be called before exiting in order for profiling and
@@ -76,10 +76,10 @@ int main()
 }
 
 // Helper function for using CUDA
-cudaError_t maxWithCuda(int *rows_mins, int *matr, unsigned int size)
+cudaError_t maxWithCuda(int* max_of_mins, int *matr, unsigned int size)
 {
-    int* dev_rows_mins = 0;
     int *dev_matr = 0;
+    int *dev_max_of_mins = 0;
     cudaError_t cudaStatus;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
@@ -92,15 +92,16 @@ cudaError_t maxWithCuda(int *rows_mins, int *matr, unsigned int size)
     // Allocate GPU buffers  
     cudaStatus = cudaMalloc((void**)&dev_matr, size * size * sizeof(int));
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
+        fprintf(stderr, "cudaMalloc failed!1");
         goto Error;
     }
 
-    cudaStatus = cudaMalloc((void**)&dev_rows_mins, size * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&dev_max_of_mins, sizeof(int));
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
+        fprintf(stderr, "cudaMalloc failed! with max");
         goto Error;
     }
+
 
     // Copy input vectors from host memory to GPU buffers.
     cudaStatus = cudaMemcpy(dev_matr, matr, size * size * sizeof(int), cudaMemcpyHostToDevice);
@@ -109,16 +110,27 @@ cudaError_t maxWithCuda(int *rows_mins, int *matr, unsigned int size)
         goto Error;
     }
 
-    cudaStatus = cudaMemcpy(dev_rows_mins, rows_mins, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
 
+
+
+    float elapsed = 0;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
 
 
     // Launch a kernel on the GPU with one thread for each column.
-    minsRows <<<1, size>>>(dev_rows_mins, dev_matr);
+    minsRows <<<size / 1024, 1024>>>(dev_max_of_mins, dev_matr, size);
+
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    printf("The elapsed time %.2f ms\n", elapsed);
 
 
 
@@ -137,18 +149,16 @@ cudaError_t maxWithCuda(int *rows_mins, int *matr, unsigned int size)
         goto Error;
     }
 
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(rows_mins, dev_rows_mins, size * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy(max_of_mins, dev_max_of_mins, sizeof(int), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
+        fprintf(stderr, "cudaMemcpy failed! with max");
         goto Error;
     }
 
 
 
     Error:
-    cudaFree(dev_rows_mins);
+    cudaFree(dev_max_of_mins);
     cudaFree(dev_matr);
     
     return cudaStatus;
